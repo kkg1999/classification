@@ -467,8 +467,8 @@ if __name__ == "__main__":
 
     for loader in dataset_loaders:
         print(f"\n=== Dataset loader: {loader.__name__} ===")
-        main_rf(data_loader=loader, num_runs=2)
-        main_nn(data_loader=loader, num_runs=2)
-        main_active_rf(data_loader=loader, num_runs=2)
-        main_active_mlp(data_loader=loader, num_runs=2)
-        main_active_qbc(data_loader=loader, num_runs=2)
+        main_rf(data_loader=loader, num_runs=20)
+        main_nn(data_loader=loader, num_runs=20)
+        main_active_rf(data_loader=loader, num_runs=20)
+        main_active_mlp(data_loader=loader, num_runs=20)
+        main_active_qbc(data_loader=loader, num_runs=20)
