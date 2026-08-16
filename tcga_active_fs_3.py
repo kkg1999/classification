@@ -3,9 +3,11 @@ Global active feature selection for cost-conscious TCGA gene-panel design.
 
 This experiment treats conventional active learning along the feature axis:
 all training labels are available, while the globally visible gene panel grows
-adaptively. Candidate genes are screened in batches and retained only when
-their conditional cross-validated improvement is large enough relative to its
-uncertainty.
+adaptively. Candidate genes are screened in batches, ranked by classifier-derived
+importance, and acquired in that order. Conditional cross-validated gains and
+their uncertainty are recorded as diagnostics rather than used as a retention
+gate. The final panel size is selected afterward by a feature-count sweep using
+the one-standard-error rule.
 
 The complete retrospective TCGA expression matrix is available during panel
 discovery. Consequently, this code primarily estimates deployment-time savings
@@ -45,9 +47,7 @@ CANDIDATES_PER_ROUND = 200
 SHORTLIST_MULTIPLIER = 3
 FINAL_N_FEATURES = 200
 FEATURE_SWEEP_STEP = 10
-MIN_SCORE_GAIN = 0.0
 ACCEPTANCE_SE_MULTIPLIER = 1.0
-NO_GAIN_PATIENCE = 3
 BASE_CLASSIFIER = "rf"  # "rf" | "svm" | "mlp"
 PRINT_TOP_10_GENE_NAMES = True
 EVALUATE_ALL_FEATURES = True
@@ -125,7 +125,7 @@ def _classifier_importances(
 
     Random forests use their embedded impurity importance for inexpensive
     screening. SVM and MLP pipelines use permutation importance. These scores
-    only create a shortlist; final acquisition is decided by paired CV gain.
+    only create and rank a shortlist; paired CV gain is recorded diagnostically.
     """
     if name == "rf":
         return clf.feature_importances_
@@ -152,9 +152,7 @@ def active_gene_select(
     genes_per_round: int = GENES_PER_ROUND,
     candidates_per_round: int = CANDIDATES_PER_ROUND,
     final_n_features: int = FINAL_N_FEATURES,
-    min_score_gain: float = MIN_SCORE_GAIN,
     acceptance_se_multiplier: float = ACCEPTANCE_SE_MULTIPLIER,
-    no_gain_patience: int = NO_GAIN_PATIENCE,
     base_classifier: str = BASE_CLASSIFIER,
     random_state: int = RANDOM_STATE,
 ) -> tuple[np.ndarray, list[str], pd.DataFrame]:
@@ -166,16 +164,12 @@ def active_gene_select(
     2. samples a batch from the unretained genes;
     3. fits a screening model on the panel plus the candidate batch;
     4. shortlists candidates using model-derived importance;
-    5. evaluates shortlisted genes sequentially using paired CV folds; and
-    6. retains a gene only when the lower-confidence gain is sufficient.
-
-    The acceptance rule is::
-
-        mean(fold gains) - acceptance_se_multiplier * SE(fold gains)
-            >= min_score_gain
+    5. acquires the highest-ranked shortlisted genes sequentially; and
+    6. records each gene's paired CV gain and uncertainty for diagnostics.
 
     ``selected_idx`` is ordered by acquisition. The held-out test set must not
-    be passed to this function.
+    be passed to this function. Panel size is chosen afterward by the
+    feature-count sweep and one-standard-error rule.
     """
     X_train = np.asarray(X_train)
     y_train = np.asarray(y_train)
@@ -195,9 +189,6 @@ def active_gene_select(
         raise ValueError("candidates_per_round must be positive.")
     if acceptance_se_multiplier < 0:
         raise ValueError("acceptance_se_multiplier cannot be negative.")
-    if no_gain_patience < 1:
-        raise ValueError("no_gain_patience must be positive.")
-
     rng = np.random.RandomState(random_state)
     n_features = X_train.shape[1]
     max_features = min(final_n_features, n_features)
@@ -218,7 +209,6 @@ def active_gene_select(
     history_rows: list[dict] = []
     screened_genes: set[int] = set()
     total_screenings = 0
-    empty_rounds = 0
     start = time.perf_counter()
 
     for round_i in range(1, n_rounds + 1):
@@ -264,7 +254,7 @@ def active_gene_select(
         candidate_conservative_gains: list[float] = []
         remaining_slots = max_features - len(committed_idx)
 
-        # Greedy conditional evaluation. Once a gene is accepted, the next
+        # Greedy conditional evaluation. Once a gene is acquired, the next
         # candidate is compared with the newly expanded panel on the same folds.
         for gene_idx in shortlist:
             if len(acquired_this_round) >= min(genes_per_round, remaining_slots):
@@ -286,25 +276,19 @@ def active_gene_select(
             candidate_mean_gains.append(mean_gain)
             candidate_gain_ses.append(gain_se)
             candidate_conservative_gains.append(conservative_gain)
+            acquired_this_round.append(gene_idx)
+            current_scores = trial_scores
+            current_score = float(np.mean(current_scores))
 
-            if conservative_gain >= min_score_gain:
-                acquired_this_round.append(gene_idx)
-                current_scores = trial_scores
-                current_score = float(np.mean(current_scores))
-
-        if acquired_this_round:
-            committed_idx.extend(acquired_this_round)
-            available_mask[acquired_this_round] = False
-            empty_rounds = 0
-        else:
-            empty_rounds += 1
+        committed_idx.extend(acquired_this_round)
+        available_mask[acquired_this_round] = False
 
         history_rows.append(
             {
                 "round": round_i,
                 "n_features_before": len(committed_idx) - len(acquired_this_round),
                 "batch_evaluated": batch_size,
-                "shortlist_evaluated": len(shortlist),
+                "shortlist_evaluated": len(candidate_mean_gains),
                 "n_screened_this_round": batch_size,
                 "n_screened_total": total_screenings,
                 "n_screened_unique": len(screened_genes),
@@ -331,12 +315,11 @@ def active_gene_select(
                 "best_conservative_gain": max(
                     candidate_conservative_gains, default=0.0
                 ),
-                "consecutive_empty_rounds": empty_rounds,
+                "candidate_mean_gains": candidate_mean_gains,
+                "candidate_gain_ses": candidate_gain_ses,
+                "candidate_conservative_gains": candidate_conservative_gains,
             }
         )
-
-        if empty_rounds >= no_gain_patience:
-            break
 
     elapsed = time.perf_counter() - start
     history = pd.DataFrame(history_rows)
