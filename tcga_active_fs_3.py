@@ -44,7 +44,7 @@ ACCEPTANCE_SE_MULTIPLIER = 1.0
 BASE_CLASSIFIER = "rf"  # "rf" | "svm" | "mlp"
 PRINT_TOP_GENE_NAMES = True
 EVALUATE_ALL_FEATURES = True
-N_REPEATS = 1
+N_REPEATS = 10
 
 
 def _make_classifier(name: str, random_state: int = RANDOM_STATE):
@@ -593,12 +593,12 @@ def run_cohort(
     if n_repeats > 1:
         print(f"\nChosen repeat: seed={winner['random_state']}")
 
-    print("\nFeature-count sweep (CV balanced accuracy):")
-    print(sweep.to_string(index=False, float_format=lambda value: f"{value:.4f}"))
-    print(
-        f"\nPeak CV panel: {peak_n} genes "
-        f"(balanced acc={peak_row['cv_balanced_accuracy']:.4f})"
-    )
+    # print("\nFeature-count sweep (CV balanced accuracy):")
+    # print(sweep.to_string(index=False, float_format=lambda value: f"{value:.4f}"))
+    # print(
+    #     f"\nPeak CV panel: {peak_n} genes "
+    #     f"(balanced acc={peak_row['cv_balanced_accuracy']:.4f})"
+    # )
     print(
         f"Minimal sufficient panel (one-SE rule): {best_n} genes "
         f"(balanced acc={selected_row['cv_balanced_accuracy']:.4f})"
