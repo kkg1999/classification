@@ -8,13 +8,6 @@ importance, and acquired in that order. Conditional cross-validated gains and
 their uncertainty are recorded as diagnostics rather than used as a retention
 gate. The final panel size is selected afterward by a feature-count sweep using
 the one-standard-error rule.
-
-The complete retrospective TCGA expression matrix is available during panel
-discovery. Consequently, this code primarily estimates deployment-time savings
-for future samples measured with the final panel. It separately tracks genes
-screened during discovery so that search cost is not confused with retained
-panel size. This is not per-patient dynamic feature acquisition, missing-value
-acquisition, pool-based active learning over labels, or multi-label learning.
 """
 
 from __future__ import annotations
@@ -39,7 +32,7 @@ from tcga_fs import evaluate_models
 from tcga_rfe import filter_features_named, prepare_cohort_split, to_symbols
 
 RANDOM_STATE = 42
-FILTER_K = 5000
+FILTER_K = 10000
 N_ROUNDS = 10
 INITIAL_N_FEATURES = 10
 GENES_PER_ROUND = 10
@@ -49,7 +42,7 @@ FINAL_N_FEATURES = 200
 FEATURE_SWEEP_STEP = 10
 ACCEPTANCE_SE_MULTIPLIER = 1.0
 BASE_CLASSIFIER = "rf"  # "rf" | "svm" | "mlp"
-PRINT_TOP_10_GENE_NAMES = True
+PRINT_TOP_GENE_NAMES = True
 EVALUATE_ALL_FEATURES = True
 
 
@@ -420,7 +413,7 @@ def report_ranked_genes(
         n_repeats=10,
         random_state=RANDOM_STATE,
         scoring="balanced_accuracy",
-        n_jobs=-1,
+        n_jobs=1,
     ).importances_mean
     order = np.argsort(importance)[::-1]
     symbols = to_symbols(selected_names, gene_symbols)
@@ -429,7 +422,7 @@ def report_ranked_genes(
     for rank, idx in enumerate(order[:top_n], start=1):
         print(
             f"  #{rank:2d} | {symbols[idx]:<15} | {selected_names[idx]} "
-            f"| importance: {importance[idx]:.4f}"
+            f"| importance: {importance[idx]:.6f}"
         )
 
 
@@ -540,7 +533,7 @@ def run_cohort(
         f"| macro F1: {held_out_macro_f1:.4f}"
     )
 
-    if PRINT_TOP_10_GENE_NAMES:
+    if PRINT_TOP_GENE_NAMES:
         report_ranked_genes(
             Xf_train,
             y_train,
