@@ -44,6 +44,15 @@ Concretely, per round:
      candidates for a later round with more labels.
   5. Stop once the feature budget or label budget is exhausted.
 
+Per-round commit rate:
+    The number of genes committed each round is paced so that filling the
+    full feature budget (final_n_features) takes roughly n_rounds rounds
+    (final_n_features / n_rounds per round), rather than a fixed fraction
+    of the candidate batch size. This ensures the acquisition loop
+    actually spans the whole label-budget schedule (round 1 through
+    n_rounds) instead of exhausting the feature budget in just the first
+    couple of rounds.
+
 Feature-count sweep:
     Rather than committing to a single hardcoded feature-set size, the
     active loop runs once up to a maximum size (FINAL_N_FEATURES), which
@@ -165,6 +174,11 @@ def active_feature_select(
     # pool each round (simulates the cost of acquiring more labelled data).
     budgets = np.linspace(0.3, 1.0, n_rounds)
 
+    # Pace the per-round commit rate so filling final_n_features takes
+    # roughly n_rounds rounds, instead of exhausting the feature budget in
+    # just the first couple of rounds regardless of the label schedule.
+    per_round_target = max(1, int(np.ceil(final_n_features / n_rounds)))
+
     history_rows = []
     start = time.perf_counter()
 
@@ -203,7 +217,9 @@ def active_feature_select(
 
         order = np.argsort(batch_importances)[::-1]
         n_remaining_slots = final_n_features - len(committed_idx)
-        n_try = max(1, min(n_remaining_slots, max(1, batch_size // 4)))
+        # Commit at most per_round_target genes this round (paced across
+        # all n_rounds), capped by the batch size and remaining slots.
+        n_try = max(1, min(n_remaining_slots, batch_size, per_round_target))
         proposed_local = batch_local[order[:n_try]]
         proposed_global = candidate_idx[proposed_local]
 
