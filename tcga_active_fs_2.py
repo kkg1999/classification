@@ -25,20 +25,20 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.svm import LinearSVC
 
 from tcga_fs import evaluate_models
-from tcga_rfe import filter_features_named, prepare_cohort_split, to_symbols
+from tcga_rfe import PRINT_TOP_10_GENE_NAMES, filter_features_named, prepare_cohort_split, to_symbols
 
 RANDOM_STATE = 42
-FILTER_K = 3000
+FILTER_K = 5000
 N_ROUNDS = 10
 INITIAL_N_FEATURES = 10
 GENES_PER_ROUND = 10
 CANDIDATES_PER_ROUND = 200
 SHORTLIST_MULTIPLIER = 3
-FINAL_N_FEATURES = 100
+FINAL_N_FEATURES = 200
 FEATURE_SWEEP_STEP = 10
 MIN_SCORE_GAIN = 0.0
 BASE_CLASSIFIER = "rf"  # "rf" | "svm" | "mlp"
-
+PRINT_TOP_10_GENE_NAMES = True
 
 def _make_classifier(name: str):
     """Build the classifier used for ranking and CV evaluation."""
@@ -313,7 +313,7 @@ def report_ranked_genes(
     rf = RandomForestClassifier(
         n_estimators=500,
         class_weight="balanced_subsample",
-        n_jobs=-1,
+        n_jobs=1,
         random_state=RANDOM_STATE,
     ).fit(X_train[:, selected_idx], y_train)
 
@@ -413,7 +413,8 @@ def run_cohort(
         f"| macro F1: {f1_score(y_test, y_pred, average='macro'):.4f}"
     )
 
-    report_ranked_genes(Xf_train, y_train, selected_idx, selected_names, gene_symbols)
+    if PRINT_TOP_10_GENE_NAMES:
+        report_ranked_genes(Xf_train, y_train, selected_idx, selected_names, gene_symbols)
     return {
         "cohort": cohort,
         "genes": to_symbols(best_names, gene_symbols),
@@ -423,11 +424,13 @@ def run_cohort(
     }
 
 
+test_algo = True
 if __name__ == "__main__":
     from tcga_download_helper import load_gene_symbols
 
     TCGA_COHORTS = ["BRCA", "COAD", "LUSC", "GBM", "OV", "LUAD", "THCA"]
-    # TCGA_COHORTS = ["BRCA", "COAD"]
+    if test_algo:
+        TCGA_COHORTS = ["BRCA", "COAD"]
     symbols = load_gene_symbols()
     for cohort_name in TCGA_COHORTS:
         print(f"\n=== {cohort_name} ===")
