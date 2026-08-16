@@ -44,6 +44,14 @@ Concretely, per round:
      candidates for a later round with more labels.
   5. Stop once the feature budget or label budget is exhausted.
 
+Feature-count sweep:
+    Rather than committing to a single hardcoded feature-set size, the
+    active loop runs once up to a maximum size (FINAL_N_FEATURES), which
+    yields genes ordered by acquisition round. `sweep_feature_counts`
+    then evaluates CV performance at increasing prefix sizes (10, 20, ...
+    100 by default) of that ordered list, and the best-performing size is
+    selected for the final held-out evaluation.
+
 This is a minimal, understandable baseline -- not a faithful
 re-implementation of the paper's cost-sensitive EVOA formalism -- meant
 as a starting point you can tune and extend.
@@ -71,7 +79,8 @@ RANDOM_STATE = 42
 FILTER_K = 3000              # stage-1 statistical pool handed to the active selector
 N_ROUNDS = 8                 # label-budget increments
 CANDIDATES_PER_ROUND = 200   # how many not-yet-committed genes to evaluate each round
-FINAL_N_FEATURES = 50        # target size of the active-selected gene set
+FINAL_N_FEATURES = 100       # max size of the active-selected gene set (sweep's upper bound)
+FEATURE_SWEEP_STEP = 10      # granularity of the feature-count sweep (10, 20, ..., FINAL_N_FEATURES)
 MIN_SCORE_GAIN = 0.0         # minimum CV-score improvement required to commit a gene batch
 BASE_CLASSIFIER = "rf"       # "rf" | "svm" | "mlp"
 
@@ -137,7 +146,10 @@ def active_feature_select(
     importance signal and its cross-validated score gain.
 
     Returns:
-        selected_idx: indices (into X_train's columns) of chosen features
+        selected_idx: indices (into X_train's columns) of chosen features,
+                      ordered by acquisition round (earliest-committed
+                      first). Use prefixes of this array to evaluate
+                      smaller feature-set sizes without rerunning the loop.
         selected_names: corresponding feature names
         history: DataFrame logging, per round, the label budget, the
                  classifier's CV score before/after committing genes, and
@@ -241,10 +253,71 @@ def active_feature_select(
     return selected_idx, selected_names, history
 
 
+def sweep_feature_counts(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    committed_order: list[int],
+    sizes: list[int],
+    base_classifier: str = BASE_CLASSIFIER,
+) -> pd.DataFrame:
+    """
+    Evaluate CV performance at each feature-count checkpoint by taking
+    prefixes of the acquisition-ordered committed gene list, so the best
+    feature-set size can be picked instead of a single hardcoded value.
+
+    Returns a DataFrame of n_features -> cv_balanced_accuracy.
+    """
+    rows = []
+    min_class_count = np.min(np.bincount(y_train.astype(int)))
+    n_splits = max(2, min(5, int(min_class_count)))
+    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
+
+    for size in sizes:
+        size = min(size, len(committed_order))
+        if size == 0:
+            continue
+        cols = committed_order[:size]
+        clf = _make_classifier(base_classifier)
+        scores = cross_val_score(
+            clf, X_train[:, cols], y_train, cv=cv,
+            scoring="balanced_accuracy", n_jobs=-1,
+        )
+        rows.append({"n_features": size, "cv_balanced_accuracy": float(np.mean(scores))})
+
+    return pd.DataFrame(rows)
+
+
+def report_ranked_genes(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    selected_idx: np.ndarray,
+    selected_names: list[str],
+    gene_symbols: dict[str, str] | None = None,
+    top_n: int = 10,
+) -> None:
+    """Refit a final RF on the selected genes and print the strongest ones."""
+    rf = RandomForestClassifier(
+        n_estimators=500,
+        class_weight="balanced_subsample",
+        n_jobs=-1,
+        random_state=RANDOM_STATE,
+    ).fit(X_train[:, selected_idx], y_train)
+
+    order = np.argsort(rf.feature_importances_)[::-1]
+    symbols = to_symbols(selected_names, gene_symbols)
+    print(f"\nTop {min(top_n, len(order))} genes (RF impurity importance):")
+    for rank, idx in enumerate(order[:top_n], start=1):
+        print(
+            f"  #{rank:2d} | {symbols[idx]:<15} | {selected_names[idx]} "
+            f"| importance: {rf.feature_importances_[idx]:.4f}"
+        )
+
+
 def run_cohort(
     cohort: str,
     filter_k: int = FILTER_K,
     base_classifier: str = BASE_CLASSIFIER,
+    feature_sizes: list[int] | None = None,
     gene_symbols=None,
 ) -> dict:
     X_train, X_test, y_train, y_test = prepare_cohort_split(cohort, binary=False)
@@ -256,13 +329,31 @@ def run_cohort(
     )
 
     # Stage 2: active, classifier-driven, budget-aware feature selection.
+    # Run once up to the largest candidate size so the acquisition-ordered
+    # gene list can be swept over cheaply, instead of rerunning per size.
+    sizes = feature_sizes or list(range(FEATURE_SWEEP_STEP, FINAL_N_FEATURES + 1, FEATURE_SWEEP_STEP))
+    max_size = max(sizes)
     selected_idx, selected_names, history = active_feature_select(
-        Xf_train, y_train, filtered_names, base_classifier=base_classifier
+        Xf_train, y_train, filtered_names,
+        final_n_features=max_size, base_classifier=base_classifier,
     )
-    Xs_train, Xs_test = Xf_train[:, selected_idx], Xf_test[:, selected_idx]
 
     print("\nAcquisition curve (per round):")
     print(history.to_string(index=False))
+
+    # Sweep feature-set sizes (10, 20, ..., FINAL_N_FEATURES by default)
+    # over the acquisition-ordered gene list and pick the best by CV score.
+    sweep = sweep_feature_counts(Xf_train, y_train, selected_idx.tolist(), sizes, base_classifier)
+    print("\nFeature-count sweep (CV balanced accuracy):")
+    print(sweep.to_string(index=False))
+
+    best_row = sweep.loc[sweep["cv_balanced_accuracy"].idxmax()]
+    best_n = int(best_row["n_features"])
+    print(f"\nBest feature count by CV: {best_n} (balanced acc={best_row['cv_balanced_accuracy']:.4f})")
+
+    best_idx = selected_idx[:best_n]
+    best_names = selected_names[:best_n]
+    Xs_train, Xs_test = Xf_train[:, best_idx], Xf_test[:, best_idx]
 
     print("\nHeld-out test performance:")
     for name, acc in evaluate_models(X_train, X_test, y_train, y_test).items():
@@ -287,8 +378,10 @@ def run_cohort(
 
     return {
         "cohort": cohort,
-        "genes": to_symbols(selected_names, gene_symbols),
+        "genes": to_symbols(best_names, gene_symbols),
+        "best_n_features": best_n,
         "history": history,
+        "sweep": sweep,
     }
 
 
