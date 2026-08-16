@@ -424,7 +424,7 @@ def run_cohort(
     }
 
 
-test_algo = True
+test_algo = False
 if __name__ == "__main__":
     from tcga_download_helper import load_gene_symbols
 
