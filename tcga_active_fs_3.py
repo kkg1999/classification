@@ -44,16 +44,17 @@ ACCEPTANCE_SE_MULTIPLIER = 1.0
 BASE_CLASSIFIER = "rf"  # "rf" | "svm" | "mlp"
 PRINT_TOP_GENE_NAMES = True
 EVALUATE_ALL_FEATURES = True
+N_REPEATS = 1
 
 
-def _make_classifier(name: str):
+def _make_classifier(name: str, random_state: int = RANDOM_STATE):
     """Build the classifier used for ranking and CV evaluation."""
     if name == "rf":
         return RandomForestClassifier(
             n_estimators=200,
             class_weight="balanced_subsample",
             n_jobs=1,
-            random_state=RANDOM_STATE,
+            random_state=random_state,
         )
     if name == "svm":
         return make_pipeline(
@@ -62,13 +63,13 @@ def _make_classifier(name: str):
                 class_weight="balanced",
                 dual="auto",
                 max_iter=10_000,
-                random_state=RANDOM_STATE,
+                random_state=random_state,
             ),
         )
     if name == "mlp":
         return make_pipeline(
             StandardScaler(),
-            MLPClassifier(max_iter=500, random_state=RANDOM_STATE),
+            MLPClassifier(max_iter=500, random_state=random_state),
         )
     raise ValueError(f"Unknown base classifier: {name}")
 
@@ -82,12 +83,18 @@ def _cv_splits(y: np.ndarray, requested: int = 5) -> int:
     return max(2, min(requested, min_class_count))
 
 
-def _cv_scores(clf, X: np.ndarray, y: np.ndarray, n_splits: int) -> np.ndarray:
+def _cv_scores(
+    clf,
+    X: np.ndarray,
+    y: np.ndarray,
+    n_splits: int,
+    random_state: int = RANDOM_STATE,
+) -> np.ndarray:
     """Return fold scores using a fixed split for paired panel comparisons."""
     cv = StratifiedKFold(
         n_splits=n_splits,
         shuffle=True,
-        random_state=RANDOM_STATE,
+        random_state=random_state,
     )
     return cross_val_score(
         clf,
@@ -113,6 +120,7 @@ def _classifier_importances(
     X: np.ndarray,
     y: np.ndarray,
     name: str,
+    random_state: int = RANDOM_STATE,
 ) -> np.ndarray:
     """Return classifier-derived scores for the fitted trial columns.
 
@@ -128,7 +136,7 @@ def _classifier_importances(
         X,
         y,
         n_repeats=5,
-        random_state=RANDOM_STATE,
+        random_state=random_state,
         scoring="balanced_accuracy",
         n_jobs=-1,
     )
@@ -210,10 +218,11 @@ def active_gene_select(
             break
 
         current_scores = _cv_scores(
-            _make_classifier(base_classifier),
+            _make_classifier(base_classifier, random_state=random_state),
             X_train[:, committed_idx],
             y_train,
             n_splits,
+            random_state=random_state,
         )
         baseline_score, _, baseline_se = _score_summary(current_scores)
         current_score = baseline_score
@@ -224,13 +233,14 @@ def active_gene_select(
         total_screenings += batch_size
 
         screening_cols = committed_idx + batch_global.tolist()
-        clf_trial = _make_classifier(base_classifier)
+        clf_trial = _make_classifier(base_classifier, random_state=random_state)
         clf_trial.fit(X_train[:, screening_cols], y_train)
         importances = _classifier_importances(
             clf_trial,
             X_train[:, screening_cols],
             y_train,
             base_classifier,
+            random_state=random_state,
         )
         batch_importances = importances[len(committed_idx) :]
         ranked_batch = batch_global[np.argsort(batch_importances)[::-1]]
@@ -256,10 +266,11 @@ def active_gene_select(
             gene_idx = int(gene_idx)
             trial_cols = committed_idx + acquired_this_round + [gene_idx]
             trial_scores = _cv_scores(
-                _make_classifier(base_classifier),
+                _make_classifier(base_classifier, random_state=random_state),
                 X_train[:, trial_cols],
                 y_train,
                 n_splits,
+                random_state=random_state,
             )
 
             fold_gains = trial_scores - current_scores
@@ -334,6 +345,7 @@ def sweep_feature_counts(
     acquisition_order: Sequence[int],
     sizes: Sequence[int],
     base_classifier: str = BASE_CLASSIFIER,
+    random_state: int = RANDOM_STATE,
 ) -> pd.DataFrame:
     """Evaluate unique acquisition-order prefixes using all training samples."""
     rows = []
@@ -352,10 +364,11 @@ def sweep_feature_counts(
             continue
         cols = list(acquisition_order[:size])
         scores = _cv_scores(
-            _make_classifier(base_classifier),
+            _make_classifier(base_classifier, random_state=random_state),
             X_train[:, cols],
             y_train,
             n_splits,
+            random_state=random_state,
         )
         score_mean, score_std, score_se = _score_summary(scores)
         rows.append(
@@ -388,6 +401,90 @@ def choose_minimal_sufficient_panel(sweep: pd.DataFrame) -> tuple[pd.Series, pd.
     ].sort_values("n_features")
     selected_row = eligible.iloc[0]
     return selected_row, peak_row
+
+
+def _discover_panel(
+    Xf_train: np.ndarray,
+    y_train: np.ndarray,
+    filtered_names: list[str],
+    sizes: Sequence[int],
+    base_classifier: str,
+    random_state: int,
+) -> dict:
+    """Run one full acquisition + sweep pass for a given seed.
+
+    Uses training data only; the held-out test set must never be passed in.
+    """
+    target_n_features = min(max(int(size) for size in sizes), Xf_train.shape[1])
+    required_rounds = max(
+        1,
+        math.ceil(
+            max(0, target_n_features - INITIAL_N_FEATURES) / GENES_PER_ROUND
+        ),
+    )
+
+    selected_idx, selected_names, history = active_gene_select(
+        Xf_train,
+        y_train,
+        filtered_names,
+        n_rounds=max(N_ROUNDS, required_rounds),
+        initial_n_features=INITIAL_N_FEATURES,
+        genes_per_round=GENES_PER_ROUND,
+        final_n_features=target_n_features,
+        base_classifier=base_classifier,
+        random_state=random_state,
+    )
+
+    sweep = sweep_feature_counts(
+        Xf_train,
+        y_train,
+        selected_idx.tolist(),
+        sizes,
+        base_classifier,
+        random_state=random_state,
+    )
+    if sweep.empty:
+        raise RuntimeError("No feature-count checkpoints were evaluated.")
+
+    selected_row, peak_row = choose_minimal_sufficient_panel(sweep)
+    best_n = int(selected_row["n_features"])
+
+    return {
+        "random_state": random_state,
+        "selected_idx": selected_idx,
+        "selected_names": selected_names,
+        "history": history,
+        "sweep": sweep,
+        "selected_row": selected_row,
+        "peak_row": peak_row,
+        "best_n": best_n,
+        "best_idx": selected_idx[:best_n],
+        "best_names": selected_names[:best_n],
+    }
+
+
+def choose_best_repeat(runs: list[dict]) -> dict:
+    """Choose the best run across repeats using CV metrics only.
+
+    Among runs whose one-SE-selected CV score is within one standard error of
+    the best score across all repeats, returns the one with the fewest
+    features. This never inspects the held-out test set.
+    """
+    if not runs:
+        raise ValueError("Cannot choose a best repeat from an empty list of runs.")
+
+    best_score_row = max(
+        runs, key=lambda r: r["selected_row"]["cv_balanced_accuracy"]
+    )
+    threshold = float(
+        best_score_row["selected_row"]["cv_balanced_accuracy"]
+    ) - float(best_score_row["selected_row"]["cv_score_se"])
+
+    eligible = [
+        r for r in runs
+        if float(r["selected_row"]["cv_balanced_accuracy"]) >= threshold
+    ]
+    return min(eligible, key=lambda r: r["best_n"])
 
 
 def report_ranked_genes(
@@ -433,8 +530,20 @@ def run_cohort(
     feature_sizes: list[int] | None = None,
     gene_symbols=None,
     evaluate_all_features: bool = EVALUATE_ALL_FEATURES,
+    n_repeats: int = N_REPEATS,
+    base_random_state: int = RANDOM_STATE,
 ) -> dict:
-    """Discover a minimal panel and evaluate it once on the held-out set."""
+    """Discover a minimal panel over one or more randomized repeats.
+
+    When ``n_repeats`` > 1, the whole acquisition + sweep pipeline is run once
+    per seed (``base_random_state + i``). The winning repeat is chosen purely
+    from CV metrics (fewest features among those within one SE of the best CV
+    score across repeats). The held-out test set is evaluated exactly once,
+    on the winning repeat's panel.
+    """
+    if n_repeats < 1:
+        raise ValueError("n_repeats must be positive.")
+
     X_train, X_test, y_train, y_test = prepare_cohort_split(cohort, binary=False)
 
     # Train-only statistical pre-filter. The held-out set is transformed using
@@ -452,41 +561,37 @@ def run_cohort(
     if not sizes or any(int(size) <= 0 for size in sizes):
         raise ValueError("feature_sizes must contain positive integers.")
 
-    target_n_features = min(max(int(size) for size in sizes), Xf_train.shape[1])
-    required_rounds = max(
-        1,
-        math.ceil(
-            max(0, target_n_features - INITIAL_N_FEATURES) / GENES_PER_ROUND
-        ),
-    )
+    runs = [
+        _discover_panel(
+            Xf_train,
+            y_train,
+            filtered_names,
+            sizes,
+            base_classifier,
+            random_state=base_random_state + i,
+        )
+        for i in range(n_repeats)
+    ]
 
-    selected_idx, selected_names, history = active_gene_select(
-        Xf_train,
-        y_train,
-        filtered_names,
-        n_rounds=max(N_ROUNDS, required_rounds),
-        initial_n_features=INITIAL_N_FEATURES,
-        genes_per_round=GENES_PER_ROUND,
-        final_n_features=target_n_features,
-        base_classifier=base_classifier,
-    )
+    if n_repeats > 1:
+        print("\nRepeat summary (best-repeat selection uses CV metrics only):")
+        for r in runs:
+            print(
+                f"  seed={r['random_state']:<4} | n_features={r['best_n']:<4} | "
+                f"cv balanced acc={r['selected_row']['cv_balanced_accuracy']:.4f}"
+            )
 
-    sweep = sweep_feature_counts(
-        Xf_train,
-        y_train,
-        selected_idx.tolist(),
-        sizes,
-        base_classifier,
-    )
-    if sweep.empty:
-        raise RuntimeError("No feature-count checkpoints were evaluated.")
-
-    selected_row, peak_row = choose_minimal_sufficient_panel(sweep)
-    best_n = int(selected_row["n_features"])
+    winner = choose_best_repeat(runs)
+    selected_idx, selected_names = winner["selected_idx"], winner["selected_names"]
+    history, sweep = winner["history"], winner["sweep"]
+    selected_row, peak_row = winner["selected_row"], winner["peak_row"]
+    best_idx, best_names = winner["best_idx"], winner["best_names"]
+    best_n = winner["best_n"]
     peak_n = int(peak_row["n_features"])
-    best_idx = selected_idx[:best_n]
-    best_names = selected_names[:best_n]
     Xs_train, Xs_test = Xf_train[:, best_idx], Xf_test[:, best_idx]
+
+    if n_repeats > 1:
+        print(f"\nChosen repeat: seed={winner['random_state']}")
 
     print("\nFeature-count sweep (CV balanced accuracy):")
     print(sweep.to_string(index=False, float_format=lambda value: f"{value:.4f}"))
@@ -562,6 +667,8 @@ def run_cohort(
             if final_history is not None
             else 0
         ),
+        "chosen_random_state": winner["random_state"],
+        "n_repeats": n_repeats,
         "history": history,
         "sweep": sweep,
     }
@@ -579,7 +686,7 @@ if __name__ == "__main__":
     for cohort_name in TCGA_COHORTS:
         print(f"\n=== {cohort_name} ===")
         try:
-            run_cohort(cohort_name, gene_symbols=symbols)
+            run_cohort(cohort_name, gene_symbols=symbols, n_repeats=N_REPEATS)
         except (ValueError, RuntimeError):
             print(f"Skipped {cohort_name} because of an error:")
             traceback.print_exc()
