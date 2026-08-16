@@ -12,7 +12,7 @@ PROBEMAP_URL = f"https://gdc-hub.s3.us-east-1.amazonaws.com/download/{PROBEMAP_F
 TCGA_COHORTS = ["BRCA", "COAD", "LUSC", "GBM", "OV", "LUAD", "THCA"]
 
 
-def load_tcga_cohort(cohort: str, save_dir: str = "./tcga_data") -> pd.DataFrame:
+def load_tcga_cohort(cohort: str, save_dir: str = "./tcgadata") -> pd.DataFrame:
     """
     Downloads and loads the UCSC Xena pre-processed STAR counts for a given TCGA cohort.
     Returns a DataFrame with samples as rows and genes as columns.
@@ -46,7 +46,7 @@ def load_tcga_cohort(cohort: str, save_dir: str = "./tcga_data") -> pd.DataFrame
     return df_ml
 
 
-def load_gene_symbols(save_dir: str = "./tcga_data") -> dict[str, str]:
+def load_gene_symbols(save_dir: str = "./tcgadata") -> dict[str, str]:
     """Downloads the matching GENCODE probemap and returns Ensembl-to-symbol mappings."""
     os.makedirs(save_dir, exist_ok=True)
     local_path = os.path.join(save_dir, PROBEMAP_FILE)
@@ -94,7 +94,7 @@ def select_top_features_anova(
 
     k = min(top_k, X_filtered.shape[1])
     print("SelectKBest...")
-    selector = SelectKBest(score_func=lambda X, y: mutual_info_classif(X, y, random_state=42), k=k)
+    selector = SelectKBest(f_classif, k=k)
     selector.fit(X_filtered, y)
     scores = np.nan_to_num(selector.scores_, nan=-np.inf)
     ranked_indices = np.argsort(scores)[::-1]
@@ -105,7 +105,7 @@ def select_top_features_anova(
         idx = ranked_indices[rank]
         feature_id = surviving_feature_ids[idx]
         gene_name = gene_symbols.get(feature_id, feature_id) if gene_symbols else feature_id
-        print(f"  #{rank + 1:2d} | Gene: {gene_name} | MI-score: {scores[idx]:.4f}")
+        print(f"  #{rank + 1:2d} | Gene: {gene_name} | score: {scores[idx]:.4f}")
 
     selected_indices = ranked_indices[:k]
     selected_feature_ids = surviving_feature_ids[selected_indices].tolist()
