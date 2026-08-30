@@ -10,12 +10,14 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.stats import binom
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_selection import f_classif
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
+    make_scorer,
     precision_score,
     recall_score,
 )
@@ -41,6 +43,10 @@ CV_SCORING = "f1_macro"      # the gate optimises the metric the paper reports
 # accuracy, then macro precision / recall / F1. Macro recall is identical to
 # balanced accuracy, so nothing is lost relative to the earlier scripts.
 METRICS = ["accuracy", "precision_macro", "recall_macro", "f1_macro"]
+# Ranking of the printed panel. Named distinctly from N_REPEATS (outer splits):
+# this is the number of shuffles per gene inside permutation_importance.
+PERM_REPEATS = 20
+PERM_SCORER = make_scorer(f1_score, average="macro", zero_division=0)
 
 INITIAL_PANEL_SIZE = 5       # random cold start, so the method is not handed the baseline
 CANDIDATES_PER_ROUND = 200   # genes screened per round by the cheap ranker
@@ -535,6 +541,30 @@ def run_repeat(X: pd.DataFrame, y: np.ndarray, seed: int) -> dict:
     scores = pd.DataFrame(rows)
     print(scores.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
 
+    # Ordering for the printed panel: permutation importance measured on the
+    # held-out split. Impurity (MDI) importance is biased towards high-variance,
+    # high-cardinality predictors (Strobl et al. 2007) -- a poor prior on log2
+    # counts -- and is measured in-sample. Permutation importance is
+    # model-agnostic, so it also works when BASE_CLASSIFIER is svm or mlp.
+    #
+    # This ordering is descriptive only: it selects nothing and does not enter
+    # any reported metric, so the held-out scores above remain unbiased.
+    ranker = _make_classifier(
+        BASE_CLASSIFIER, n_estimators=FINAL_TREES, n_jobs=-1
+    )
+    ranker.fit(Xf_train[:, list(panel)], y_train)
+    perm = permutation_importance(
+        ranker,
+        Xf_test[:, list(panel)],
+        y_test,
+        n_repeats=PERM_REPEATS,
+        random_state=RANDOM_STATE,
+        scoring=PERM_SCORER,
+        n_jobs=-1,
+    )
+    panel_importances = perm.importances_mean.astype(float)
+    panel_importances_std = perm.importances_std.astype(float)
+
     return {
         "seed": seed,
         "panel_names": [filtered_names[i] for i in panel],
@@ -547,6 +577,9 @@ def run_repeat(X: pd.DataFrame, y: np.ndarray, seed: int) -> dict:
         "n_screened_unique": result["n_screened_unique"],
         "elapsed_s": result["elapsed_s"],
         "stop_reason": result["stop_reason"],
+        "panel_importances": panel_importances,
+        "panel_importances_std": panel_importances_std,
+        "pool_size": int(Xf_train.shape[1]),
     }
 
 
@@ -593,6 +626,176 @@ def panel_stability(repeats: list[dict]) -> float:
     return float(np.mean(overlaps)) if overlaps else float("nan")
 
 
+def report_best_panel(
+    repeats: list[dict], symbols: dict[str, str] | None = None
+) -> tuple[dict, pd.DataFrame]:
+    """Pick and print the single best panel across the outer splits.
+
+    The winner is chosen by ``cv_mean``, the selection-time cross-validation
+    score, which is computed on training data only. Choosing by held-out score
+    would make the reported test metric a biased, optimistically selected
+    number rather than an honest generalisation estimate.
+
+    Ties break towards the smaller panel (cheaper assay), then the lower seed,
+    so the choice is fully deterministic.
+    """
+    best = sorted(
+        repeats, key=lambda r: (-r["cv_mean"], r["n_features"], r["seed"])
+    )[0]
+
+    print(f"\n=== best panel (selected by CV {CV_SCORING} on training data) ===")
+    print(
+        f"  seed={best['seed']} | {best['n_features']} genes "
+        f"| selection CV={best['cv_mean']:.4f} | stopped: {best['stop_reason']}"
+    )
+
+    gene_symbols = to_symbols(best["panel_names"], symbols)
+    ranked = pd.DataFrame(
+        {
+            "ensembl": best["panel_names"],
+            "symbol": gene_symbols,
+            "importance": best["panel_importances"],
+            "importance_std": best["panel_importances_std"],
+            # Position in the panel list is the order genes were acquired; the
+            # first INITIAL_PANEL_SIZE are the random cold start and were never
+            # put through the acceptance gate.
+            "acquisition_order": range(1, best["n_features"] + 1),
+        }
+    )
+    ranked["cold_start"] = ranked["acquisition_order"] <= INITIAL_PANEL_SIZE
+    # Descending importance, ties broken by acquisition order so the printed
+    # list is deterministic. Permutation importance is signed: a gene whose
+    # removal *improves* the held-out score scores below zero and sorts last,
+    # which is the correct place for it.
+    ranked = ranked.sort_values(
+        ["importance", "acquisition_order"], ascending=[False, True]
+    ).reset_index(drop=True)
+
+    print(
+        f"  ordered by held-out permutation importance "
+        f"(drop in macro F1 over {PERM_REPEATS} shuffles):"
+    )
+    for rank, row in enumerate(ranked.itertuples(), start=1):
+        flag = " [cold-start]" if row.cold_start else ""
+        print(
+            f"    {rank:3d}. {row.symbol:<15} | {row.ensembl:<22} "
+            f"| {row.importance:+.4f} +/- {row.importance_std:.4f} "
+            f"| acq #{row.acquisition_order}{flag}"
+        )
+
+    n_positive = int((ranked["importance"] > 0).sum())
+    print(
+        f"\n  {n_positive} of {len(ranked)} genes have positive held-out "
+        f"importance; the remainder are redundant given the rest of the panel."
+    )
+
+    active_row = best["scores"].loc[best["scores"]["method"] == "active"]
+    print("\n  held-out performance of this panel (reported, not used to pick it):")
+    print(
+        "   "
+        + active_row.to_string(index=False, float_format=lambda v: f"{v:.4f}")
+        .replace("\n", "\n   ")
+    )
+    return best, ranked
+
+
+def recurrent_genes(
+    repeats: list[dict], symbols: dict[str, str] | None = None, min_splits: int = 2
+) -> pd.DataFrame:
+    """Genes selected on several splits, with a chance-level significance test.
+
+    Under the null that a panel is drawn uniformly from the filtered pool, a
+    given gene enters one panel with probability p = k / pool_size. Recurrence
+    across the independent outer splits is then Binomial(N_REPEATS, p), so
+    P(X >= m) is the probability of seeing a gene at least m times by chance.
+    Benjamini-Hochberg controls the FDR across every gene that was selected.
+
+    Two honest caveats for the write-up:
+      * the splits share ~80% of their samples, so they are not fully
+        independent and the p-values are somewhat anti-conservative;
+      * only genes selected at least once are tested, so a gene at m = 1 is
+        conditioned on being selected and its p-value is not meaningful. Read
+        the m >= 2 rows, which is what ``min_splits`` defaults to.
+    """
+    n_repeats = len(repeats)
+    counts: dict[str, int] = {}
+    for r in repeats:
+        for gene in r["panel_names"]:
+            counts[gene] = counts.get(gene, 0) + 1
+
+    # Mean per-split inclusion probability under uniform random selection.
+    pool_size = float(np.mean([r["pool_size"] for r in repeats]))
+    mean_panel_size = float(np.mean([r["n_features"] for r in repeats]))
+    p_null = mean_panel_size / pool_size if pool_size > 0 else 0.0
+
+    genes = list(counts)
+    if not genes:
+        table = pd.DataFrame(
+            columns=[
+                "ensembl",
+                "symbol",
+                "n_splits",
+                "frequency",
+                "expected_by_chance",
+                "p_binomial",
+                "p_adj_bh",
+            ]
+        )
+        print(
+            f"\n=== genes selected on >= {min_splits} of {n_repeats} splits "
+            f"(0 of 0 ever selected) ==="
+        )
+        print(
+            f"  null: pool={pool_size:.0f} genes, p={p_null:.5f} per split, "
+            f"expected recurrence={n_repeats * p_null:.3f}"
+        )
+        print("  none -- every gene was selected on at most one split")
+        print("\n  significant at BH-adjusted 5%: 0 genes")
+        return table
+
+    observed = np.array([counts[g] for g in genes])
+    # sf(m - 1) == P(X >= m)
+    p_values = binom.sf(observed - 1, n_repeats, p_null)
+
+    order = np.argsort(p_values)
+    ranks = np.arange(1, len(genes) + 1)
+    adjusted = np.empty(len(genes), dtype=float)
+    adjusted[order] = np.minimum.accumulate(
+        (p_values[order] * len(genes) / ranks)[::-1]
+    )[::-1].clip(0.0, 1.0)
+
+    table = pd.DataFrame(
+        {
+            "ensembl": genes,
+            "symbol": to_symbols(genes, symbols),
+            "n_splits": observed,
+            "frequency": observed / n_repeats,
+            "expected_by_chance": n_repeats * p_null,
+            "p_binomial": p_values,
+            "p_adj_bh": adjusted,
+        }
+    ).sort_values(
+        ["n_splits", "p_adj_bh"], ascending=[False, True]
+    ).reset_index(drop=True)
+
+    recurrent = table[table["n_splits"] >= min_splits]
+    significant = recurrent[recurrent["p_adj_bh"] < 0.05]
+    print(
+        f"\n=== genes selected on >= {min_splits} of {n_repeats} splits "
+        f"({len(recurrent)} of {len(table)} ever selected) ==="
+    )
+    print(
+        f"  null: pool={pool_size:.0f} genes, p={p_null:.5f} per split, "
+        f"expected recurrence={n_repeats * p_null:.3f}"
+    )
+    if len(recurrent):
+        print(recurrent.to_string(index=False, float_format=lambda v: f"{v:.4g}"))
+    else:
+        print("  none -- every gene was selected on at most one split")
+    print(f"\n  significant at BH-adjusted 5%: {len(significant)} genes")
+    return table
+
+
 def save_cohort_results(
     cohort: str,
     repeats: list[dict],
@@ -631,11 +834,15 @@ def save_cohort_results(
     print("\n=== acquisition cost ===")
     print(cost.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
     print(f"\nPanel stability (mean pairwise Jaccard): {panel_stability(repeats):.4f}")
+    best, best_ranked = report_best_panel(repeats, symbols)
+    recurrence = recurrent_genes(repeats, symbols)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     summary.to_csv(out_dir / "summary.csv", index=False)
     transfer.to_csv(out_dir / "transfer.csv", index=False)
     cost.to_csv(out_dir / "cost.csv", index=False)
+    recurrence.to_csv(out_dir / "gene_recurrence.csv", index=False)
+    best_ranked.to_csv(out_dir / "best_panel_ranked.csv", index=False)
     pd.concat(
         [r["history"].assign(seed=r["seed"]) for r in repeats], ignore_index=True
     ).to_csv(out_dir / "acquisition_history.csv", index=False)
@@ -643,6 +850,7 @@ def save_cohort_results(
         str(r["seed"]): {
             "ensembl": r["panel_names"],
             "symbols": to_symbols(r["panel_names"], symbols),
+            "is_best": r["seed"] == best["seed"],
         }
         for r in repeats
     }
